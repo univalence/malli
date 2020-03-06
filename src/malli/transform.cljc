@@ -83,7 +83,7 @@
     (try
       #?(:clj  (Long/parseLong x)
          :cljs (let [x' (js/parseInt x 10)]
-                 (if (js/isNaN x') x x')))
+                    (if (js/isNaN x') x x')))
       (catch #?(:clj Exception, :cljs js/Error) _ x))
     x))
 

@@ -12,7 +12,7 @@
 
 (defprotocol Schema
   (-name [this] "returns name of the schema")
-  (-validator [this] "returns a predicate function that checks if the schema is valid")
+  (-conform [this] "returns a predicate function that tries to conform the given value to the current schema")
   (-explainer [this path] "returns a function of `x in acc -> maybe errors` to explain the errors for invalid values")
   (-transformer [this transformer method options] "returns an interceptor map with :enter and :leave functions to transform the value for the given schema and method")
   (-accept [this visitor options] "accepts the visitor to visit schema and it's children")
@@ -20,8 +20,15 @@
   (-options [this] "returns original options")
   (-form [this] "returns original form of the schema"))
 
+(defprotocol Validator
+  (-validator [this] "return a function that checks if the given value respects the current schema, returning a boolean"))
+
+(extend-protocol Validator
+  #?(:clj Object :cljs default)
+  (-validator [this] (fn [x] (conform? (-conform this)))))
+
 (defprotocol MapSchema
-  (-map-entries [this] "returns map entries"))
+  (-map-entries [this] "returns a predicate function that checks if the schema is valid"))
 
 (defprotocol LensSchema
   (-get [this key default] "returns schema at key")
@@ -45,6 +52,57 @@
 ;;
 ;; impl
 ;;
+
+(do :conformers-composition
+
+    (def unconform ::unconform)
+    (defn unconform? [x] (= x ::unconform))
+    (defn conform? [x] (not= ::unconform x))
+
+    (defmacro if_c [test then & [else]]
+      `(if (conform? ~test) ~then ~(or else ::unconform)))
+
+    (defmacro if-let_c [[pat expr] then & [else]]
+      `(let [x# ~expr]
+         (if (conform? x#)
+           (let [~pat x#] ~then)
+           ~(or else ::unconform))))
+
+    (defmacro when_c [test & body]
+      `(if_c ~test (do ~@body)))
+
+    (defmacro when-let_c [binding & body]
+      `(if-let_c ~binding (do ~@body)))
+
+    (defmacro or_c
+      ([] ::unconform)
+      ([x & next] `(if-let_c [or# ~x] or# (or_c ~@next))))
+
+    (defmacro and_c
+      ([] true)
+      ([x & next] `(when_c ~x (and_c ~@next))))
+
+    (defn conformer-chain [conformers]
+      (if-not (seq conformers)
+        identity
+        (fn [x]
+          (loop [x x cs conformers]
+            (if-not cs
+              x (when-let_c [conformed ((first cs) x)]
+                            (recur conformed (next cs))))))))
+
+    (defn conformer-fork [conformers]
+      (if-not (seq conformers)
+        (constantly ::unconform)
+        (fn [x]
+          (loop [cs conformers]
+            (if (seq cs)
+              (if-let_c [conformed ((first cs) x)]
+                        conformed
+                        (recur (next cs)))
+              ::unconform)))))
+    )
+
 
 (declare schema into-schema)
 (declare eval)
@@ -79,7 +137,12 @@
     (seq children) (into [name] children)
     :else name))
 
-(defn- -guard [pred tf] (if tf (fn [x] (if (pred x) (tf x) x))))
+(defn- -guard [pred tf]
+  (if tf (fn [x] (if (pred x) (tf x) x))))
+
+(defn- -predicate->conforming-fn [f]
+  (fn [x]
+    (if (f x) x ::unconform)))
 
 (defn- -chain [phase chain]
   (when-let [fns (->> (case phase, :enter (rseq chain), :leave chain)
@@ -87,20 +150,20 @@
                       (seq))]
     (apply comp fns)))
 
-(defn- -leaf-schema [name ->validator-and-children]
+(defn- -leaf-schema [name ->conformer-and-children]
   ^{:type ::into-schema}
   (reify IntoSchema
     (-into-schema [_ properties children options]
-      (let [[validator children] (->validator-and-children properties children options)
+      (let [[conformer children] (->conformer-and-children properties children options)
             form (create-form name properties children)]
         ^{:type ::schema}
         (reify
           Schema
           (-name [_] name)
-          (-validator [_] validator)
+          (-conform [_] conformer)
           (-explainer [this path]
             (fn [value in acc]
-              (if-not (validator value) (conj acc (error path in this value)) acc)))
+              (if-not (conform? (conformer value)) (conj acc (error path in this value)) acc)))
           (-transformer [this transformer method options]
             (-value-transformer transformer this method options))
           (-accept [this visitor options] (visitor this (vec children) options))
@@ -124,19 +187,37 @@
         (fail! ::child-error {:name name, :properties properties, :children children, :min 1, :max 1}))
       [#(try (f % child) (catch #?(:clj Exception, :cljs js/Error) _ false)) children])))
 
-(defn- -composite-schema [name f short-circuit]
+(defn- -predicate-schema [name f]
+  (-leaf-schema
+    name
+    (fn [properties children _]
+      (when (seq children)
+        (fail! ::child-error {:name name, :properties properties, :children children, :min 0, :max 0}))
+      [(-predicate->conforming-fn f) children])))
+
+(defn- -partial-predicate-schema [name f]
+  (let [cfn (-predicate->conforming-fn f)]
+    (-leaf-schema
+      name
+      (fn [properties children _]
+        (when-not (pos? (count children))
+          (fail! ::child-error {:name name, :properties properties, :children children, :min 1}))
+        [#(apply cfn % children) children]))))
+
+(defn -composite-schema [{:keys [name compose short-circuit shrink]}]
   ^{:type ::into-schema}
   (reify IntoSchema
     (-into-schema [_ properties children options]
-      (when-not (seq children)
-        (fail! ::no-children {:name name, :properties properties}))
+      #_(when-not (seq children)
+          (fail! ::no-children {:name name, :properties properties}))
       (let [child-schemas (mapv #(schema % options) children)
-            validators (distinct (map -validator child-schemas))
-            validator (apply f validators)]
+            validators (map -conform child-schemas)
+            validators (if shrink (distinct validators) validators)
+            validator (compose validators)]
         ^{:type ::schema}
         (reify Schema
           (-name [_] name)
-          (-validator [_] validator)
+          (-conform [_] validator)
           (-explainer [_ path]
             (let [distance (if (seq properties) 2 1)
                   explainers (mapv (fn [[i c]] (-explainer c (into path [(+ i distance)]))) (map-indexed vector child-schemas))]
@@ -182,6 +263,48 @@
           (-get [_ key default] (get child-schemas key default))
           (-set [_ key value] (into-schema name properties (assoc child-schemas key value))))))))
 
+(def -and-schema
+  (-composite-schema
+    {:name :and
+     :compose
+     (fn [conformers]
+       (if-not (seq conformers)
+         identity
+         (fn [x]
+           (loop [x x cs conformers]
+             (if-not cs
+               x (let [conformed ((first cs) x)]
+                   (if (conform? conformed)
+                     (recur conformed (next cs))
+                     ::unconform)))))))
+     :short-circuit false
+     :shrink true}))
+
+(def -or-schema
+  (-composite-schema
+    {:name :or
+     :compose
+     (fn [conformers]
+       (if-not (seq conformers)
+         (constantly ::unconform)
+         #_(letfn [(loop [x cs]
+                     (when_c cs (or_c ((first cs) x) (loop x (next cs)))))]
+             (fn [x] (loop x conformers)))
+         (fn [x]
+           (loop [cs conformers]
+             (if (seq cs)
+               (let [conformed ((first cs) x)]
+                 (if (conform? conformed)
+                   conformed
+                   (recur (next cs))))
+               ::unconform)))))
+     :short-circuit true
+     :shrink true}))
+
+(comment
+  (conform nil? nil)
+  (assert (nil? (conform [:or number? nil?] nil))))
+
 (defn- -properties-and-children [xs]
   (if ((some-fn map? nil?) (first xs))
     [(first xs) (rest xs)]
@@ -209,29 +332,61 @@
             forms (map-entry-forms entries)
             form (create-form :map properties forms)]
         ^{:type ::schema}
-        (reify Schema
-          (-name [_] :map)
+        (reify
+          Validator
           (-validator [_]
-            (let [validators (cond-> (mapv
-                                       (fn [[key {:keys [optional]} value]]
-                                         (let [valid? (-validator value)
-                                               default (boolean optional)]
-                                           (fn [m] (if-let [map-entry (find m key)] (valid? (val map-entry)) default))))
-                                       entries)
-                                     closed (into [(fn [m]
-                                                     (reduce
-                                                       (fn [acc k] (if (contains? keyset k) acc (reduced false)))
-                                                       true (keys m)))]))
-                  validate (fn [m]
-                             (boolean
-                               #?(:clj  (let [it (.iterator ^Iterable validators)]
-                                          (boolean
-                                            (loop []
-                                              (if (.hasNext it)
-                                                (and ((.next it) m) (recur))
-                                                true))))
-                                  :cljs (reduce #(or (%2 m) (reduced false)) true validators))))]
-              (fn [m] (and (map? m) (validate m)))))
+            (let [validators
+                  (cond-> (mapv
+                            (fn [[key {:keys [optional]} value]]
+                              (let [valid? (-conform value)
+                                    default (boolean optional)]
+                                (fn [m] (if-let [map-entry (find m key)] (valid? (val map-entry)) default))))
+                            entries)
+                          closed (into [(fn [m]
+                                          (reduce
+                                            (fn [acc k] (if (contains? keyset k) acc (reduced false)))
+                                            true (keys m)))]))
+                  check
+                  (fn [m]
+                    (boolean
+                      #?(:clj  (let [it (.iterator ^Iterable validators)]
+                                 (boolean
+                                   (loop []
+                                     (if (.hasNext it)
+                                       (and ((.next it) m) (recur))
+                                       true))))
+                         :cljs (reduce #(or (%2 m) (reduced false)) true validators))))]
+              (fn [m] (and (map? m) (check m)))))
+          Schema
+          (-name [_] :map)
+          (-conform [_]
+            (let [validators2
+                  (cond-> (mapv
+                            (fn [[key {:keys [optional]} value]]
+                              (let [cfn (-conform value)
+                                    default (boolean optional)]
+                                (fn [m] (if-let [map-entry (find m key)]
+                                          (when-let_c [v' (cfn (val map-entry))]
+                                                      (assoc m key v'))
+                                          default))))
+                            entries)
+
+                          closed
+                          (into [(fn [m]
+                                   (when_c (reduce
+                                             (fn [acc k] (if (contains? keyset k) acc (reduced ::unconform)))
+                                             true (keys m))
+                                           m))]))
+
+                  conform
+                  (fn [m]
+                    (loop [ret m vs validators2]
+                      (if-not vs
+                        ret
+                        (when-let [m' ((first vs) m)] (recur m' (next vs))))))]
+
+              (fn [m] (and (map? m) (conform m) #_(validate m)))))
+
           (-explainer [this path]
             (let [distance (if (seq properties) 2 1)
                   explainers (cond-> (mapv
@@ -307,8 +462,8 @@
       (when-not (and (seq children) (= 2 (count children)))
         (fail! ::child-error {:name :vector, :properties properties, :children children, :min 2, :max 2}))
       (let [[key-schema value-schema :as schemas] (mapv #(schema % options) children)
-            key-valid? (-validator key-schema)
-            value-valid? (-validator value-schema)
+            key-valid? (-conform key-schema)
+            value-valid? (-conform value-schema)
             validate (fn [m]
                        (reduce-kv
                          (fn [_ key value]
@@ -317,7 +472,7 @@
         ^{:type ::schema}
         (reify Schema
           (-name [_] :map-of)
-          (-validator [_] (fn [m] (and (map? m) (validate m))))
+          (-conform [_] (fn [m] (and (map? m) (validate m))))
           (-explainer [this path]
             (let [distance (if (seq properties) 2 1)
                   key-explainer (-explainer key-schema (conj path distance))
@@ -375,8 +530,8 @@
         ^{:type ::schema}
         (reify Schema
           (-name [_] name)
-          (-validator [_]
-            (let [validator (-validator schema)]
+          (-conform [_]
+            (let [validator (-conform schema)]
               (fn [x] (and (fpred x)
                            (validate-limits x)
                            (reduce (fn [acc v] (if (validator v) acc (reduced false))) true x)))))
@@ -418,19 +573,28 @@
     (-into-schema [_ properties children options]
       (let [schemas (mapv #(schema % options) children)
             size (count schemas)
-            form (create-form :tuple properties (map -form schemas))
-            validators (into (array-map) (map-indexed vector (mapv -validator schemas)))]
+            #_#_form (create-form :tuple properties (map -form schemas))
+            validators (into (array-map) (map-indexed vector (mapv -conform schemas)))]
         (when-not (seq children)
           (fail! ::child-error {:name :tuple, :properties properties, :children children, :min 1}))
         ^{:type ::schema}
         (reify Schema
           (-name [_] :tuple)
-          (-validator [_]
+          (-conform [_]
             (fn [x] (and (vector? x)
                          (= (count x) size)
-                         (reduce-kv
-                           (fn [acc i validator]
-                             (if (validator (nth x i)) acc (reduced false))) true validators))))
+                         (loop [x x vs validators]
+                           (if-not (seq vs)
+                             x (let [v (first vs)
+                                     i (key v)
+                                     ]
+                                 (when-let_c [conformed ((val v) (get x i))]
+                                             (recur (assoc x i conformed) (next vs))
+                                             ;::unconform
+                                             ))))
+                         #_(reduce-kv
+                             (fn [acc i validator]
+                               (if (validator (nth x i)) acc (reduced false))) true validators))))
           (-explainer [this path]
             (let [distance (if (seq properties) 2 1)
                   explainers (mapv (fn [[i s]]
@@ -460,7 +624,7 @@
           (-accept [this visitor options] (visitor this (mapv #(-accept % visitor options) schemas) options))
           (-properties [_] properties)
           (-options [_] options)
-          (-form [_] form)
+          (-form [_] (create-form :tuple properties (map -form schemas)) #_form)
           LensSchema
           (-get [_ key default] (get schemas key default))
           (-set [_ key value] (into-schema :tuple properties (assoc schemas key value))))))))
@@ -476,7 +640,7 @@
         ^{:type ::schema}
         (reify Schema
           (-name [_] :enum)
-          (-validator [_] validator)
+          (-conform [_] validator)
           (-explainer [this path]
             (fn explain [x in acc]
               (if-not (validator x) (conj acc (error path in this x)) acc)))
@@ -500,7 +664,7 @@
         ^{:type ::schema}
         (reify Schema
           (-name [_] :re)
-          (-validator [_] validator)
+          (-conform [_] validator)
           (-explainer [this path]
             (fn explain [x in acc]
               (try
@@ -527,7 +691,7 @@
         ^{:type ::schema}
         (reify Schema
           (-name [_] :fn)
-          (-validator [_] validator)
+          (-conform [_] validator)
           (-explainer [this path]
             (fn explain [x in acc]
               (try
@@ -550,12 +714,12 @@
       (when-not (= 1 (count children))
         (fail! ::child-error {:name :vector, :properties properties, :children children, :min 1, :max 1}))
       (let [schema' (-> children first (schema options))
-            validator' (-validator schema')
+            validator' (-conform schema')
             form (create-form :maybe properties [(-form schema')])]
         ^{:type ::schema}
         (reify Schema
           (-name [_] :maybe)
-          (-validator [_] (fn [x] (or (nil? x) (validator' x))))
+          (-conform [_] (fn [x] (or (nil? x) (validator' x))))
           (-explainer [this path]
             (fn explain [x in acc]
               (if-not (or (nil? x) (validator' x)) (conj acc (error path in this x)) acc)))
@@ -592,8 +756,8 @@
         ^{:type ::schema}
         (reify Schema
           (-name [_] :multi)
-          (-validator [_]
-            (let [validators (reduce-kv (fn [acc k s] (assoc acc k (-validator s))) {} dispatch-map)]
+          (-conform [_]
+            (let [validators (reduce-kv (fn [acc k s] (assoc acc k (-conform s))) {} dispatch-map)]
               (fn [x]
                 (if-let [validator (validators (dispatch x))]
                   (validator x)
@@ -629,17 +793,18 @@
     (fail! ::schema-already-registered {:key k, :registry registry}))
   (assoc registry k schema))
 
-(defn- -register-var [registry v]
+(defn- -register-predicate-var [registry v]
   (let [name (-> v meta :name)
-        schema (fn-schema name @v)]
+        schema (-predicate-schema name @v)]
     (-> registry
         (-register name schema)
         (-register @v schema))))
 
-(defn- -schema [?schema {:keys [registry] :as options :or {registry default-registry}}]
-  (or (if (satisfies? IntoSchema ?schema) ?schema)
-      (get registry ?schema)
-      (some-> registry (get (type ?schema)) (-into-schema nil [?schema] options))))
+(defn- -schema [?schema {:keys [registry schemas] :as options :or {registry default-registry}}]
+  (let [registry (merge registry schemas)]
+    (or (if (satisfies? IntoSchema ?schema) ?schema)
+        (get registry ?schema)
+        (some-> registry (get (type ?schema)) (-into-schema nil [?schema] options)))))
 
 (defn ^:no-doc into-transformer [x]
   (cond
@@ -651,153 +816,168 @@
 ;; public api
 ;;
 
-(defn into-schema
-  ([name properties children]
-   (into-schema name properties children nil))
-  ([name properties children options]
-   (-into-schema (-schema name options) (if (seq properties) properties) children options)))
+(do
 
-(defn schema? [x]
-  (satisfies? Schema x))
+  (defn into-schema
+    ([name properties children]
+     (into-schema name properties children nil))
+    ([name properties children options]
+     (-into-schema (-schema name options) (if (seq properties) properties) children options)))
 
-(defn schema
-  ([?schema]
-   (schema ?schema nil))
-  ([?schema options]
-   (cond
-     (schema? ?schema) ?schema
-     (satisfies? IntoSchema ?schema) (-into-schema ?schema nil nil options)
-     (vector? ?schema) (apply into-schema (concat [(-schema (first ?schema) options)]
-                                                  (-properties-and-children (rest ?schema)) [options]))
-     :else (or (some-> ?schema (-schema options) (schema options)) (fail! ::invalid-schema {:schema ?schema})))))
+  (defn schema? [x]
+    (satisfies? Schema x))
 
-(defn form
-  ([?schema]
-   (form ?schema nil))
-  ([?schema options]
-   (-form (schema ?schema options))))
-
-(defn accept
-  ([?schema visitor]
-   (accept ?schema visitor nil))
-  ([?schema visitor options]
-   (-accept (schema ?schema options) visitor options)))
-
-(defn properties
-  ([?schema]
-   (properties ?schema nil))
-  ([?schema options]
-   (-properties (schema ?schema options))))
-
-(defn options
-  ([?schema]
-   (options ?schema nil))
-  ([?schema options]
-   (-options (schema ?schema options))))
-
-(defn children
-  ([?schema]
-   (children ?schema nil))
-  ([?schema options]
-   (let [schema (schema ?schema options)
-         form (-form schema)]
-     (if (vector? form)
-       (->> form (drop (if (seq (-properties schema)) 2 1)))))))
-
-(defn name
-  ([?schema]
-   (name ?schema nil))
-  ([?schema options]
-   (-name (schema ?schema options))))
-
-(defn validator
-  ([?schema]
-   (validator ?schema nil))
-  ([?schema options]
-   (-validator (schema ?schema options))))
-
-(defn validate
-  ([?schema value]
-   (validate ?schema value nil))
-  ([?schema value options]
-   ((validator ?schema options) value)))
-
-(defn explainer
-  ([?schema]
-   (explainer ?schema nil))
-  ([?schema options]
-   (let [schema' (schema ?schema options)
-         explainer' (-explainer schema' [])]
-     (fn explainer
-       ([value]
-        (explainer value [] []))
-       ([value in acc]
-        (if-let [errors (seq (explainer' value in acc))]
-          {:schema schema'
-           :value value
-           :errors errors}))))))
-
-(defn explain
-  ([?schema value]
-   (explain ?schema value nil))
-  ([?schema value options]
-   ((explainer ?schema options) value [] [])))
-
-(defn decoder
-  "Creates a value decoding transformer given a transformer and a schema."
-  ([?schema t]
-   (decoder ?schema nil t))
-  ([?schema options t]
-   (let [{:keys [enter leave]} (-transformer (schema ?schema options) (into-transformer t) :decode options)]
+  (defn schema
+    ([?schema]
+     (schema ?schema nil))
+    ([?schema options]
+     ;; TODO do we want to allow value value schemas, I mean 42 could be a schema that matches 42 only ?
      (cond
-       (and enter leave) (comp leave enter)
-       (or enter leave) (or enter leave)
-       :else identity))))
+       (schema? ?schema) ?schema
+       (satisfies? IntoSchema ?schema) (-into-schema ?schema nil nil options)
+       (vector? ?schema) (apply into-schema (concat [(-schema (first ?schema) options)]
+                                                    (-properties-and-children (rest ?schema)) [options]))
+       :else (or (some-> ?schema (-schema options) (schema options)) (fail! ::invalid-schema {:schema ?schema})))))
 
-(defn decode
-  "Transforms a value with a given decoding transformer against a schema."
-  ([?schema value t]
-   (decode ?schema value nil t))
-  ([?schema value options t]
-   (if-let [transform (decoder ?schema options t)]
-     (transform value)
-     value)))
+  (defn form
+    ([?schema]
+     (form ?schema nil))
+    ([?schema options]
+     (-form (schema ?schema options))))
 
-(defn encoder
-  "Creates a value encoding transformer given a transformer and a schema."
-  ([?schema t]
-   (encoder ?schema nil t))
-  ([?schema options t]
-   (let [{:keys [enter leave]} (-transformer (schema ?schema options) (into-transformer t) :encode options)]
-     (cond
-       (and enter leave) (comp leave enter)
-       (or enter leave) (or enter leave)
-       :else identity))))
+  (defn accept
+    ([?schema visitor]
+     (accept ?schema visitor nil))
+    ([?schema visitor options]
+     (-accept (schema ?schema options) visitor options)))
 
-(defn encode
-  "Transforms a value with a given encoding transformer against a schema."
-  ([?schema value t]
-   (encode ?schema value nil t))
-  ([?schema value options t]
-   (if-let [transform (encoder ?schema options t)]
-     (transform value)
-     value)))
+  (defn properties
+    ([?schema]
+     (properties ?schema nil))
+    ([?schema options]
+     (-properties (schema ?schema options))))
 
-(defn map-entries
-  "Returns a sequence of 3-element map-entry tuples of type `key ?properties schema`"
-  ([?schema]
-   (map-entries ?schema nil))
-  ([?schema options]
-   (if-let [schema (schema ?schema options)]
-     (if (satisfies? MapSchema schema)
-       (-map-entries schema)))))
+  (defn options
+    ([?schema]
+     (options ?schema nil))
+    ([?schema options]
+     (-options (schema ?schema options))))
 
-(defn ^:no-doc eval [?code]
-  (if (fn? ?code) ?code (sci/eval-string (str ?code) {:preset :termination-safe
-                                                      :bindings {'m/properties properties
-                                                                 'm/name name
-                                                                 'm/children children
-                                                                 'm/map-entries map-entries}})))
+  (defn children
+    ([?schema]
+     (children ?schema nil))
+    ([?schema options]
+     (let [schema (schema ?schema options)
+           form (-form schema)]
+       (if (vector? form)
+         (->> form (drop (if (seq (-properties schema)) 2 1)))))))
+
+  (defn name
+    ([?schema]
+     (name ?schema nil))
+    ([?schema options]
+     (-name (schema ?schema options))))
+
+  (defn conformer
+    ([?schema]
+     (conformer ?schema nil))
+    ([?schema options]
+     (-conform (schema ?schema options))))
+
+  (defn conform
+    ([?schema value]
+     (conform ?schema value nil))
+    ([?schema value options]
+     ((conformer ?schema options) value)))
+
+  (defn validator
+    ([?schema]
+     (validator ?schema nil))
+    ([?schema options]
+     (-validator (schema ?schema options))))
+
+  (defn validate
+    ([?schema value]
+     (validate ?schema value nil))
+    ([?schema value options]
+     ((validator ?schema options) value)))
+
+  (defn explainer
+    ([?schema]
+     (explainer ?schema nil))
+    ([?schema options]
+     (let [schema' (schema ?schema options)
+           explainer' (-explainer schema' [])]
+       (fn explainer
+         ([value]
+          (explainer value [] []))
+         ([value in acc]
+          (if-let [errors (seq (explainer' value in acc))]
+            {:schema schema'
+             :value value
+             :errors errors}))))))
+
+  (defn explain
+    ([?schema value]
+     (explain ?schema value nil))
+    ([?schema value options]
+     ((explainer ?schema options) value [] [])))
+
+  (defn decoder
+    "Creates a value decoding transformer given a transformer and a schema."
+    ([?schema t]
+     (decoder ?schema nil t))
+    ([?schema options t]
+     (let [{:keys [enter leave]} (-transformer (schema ?schema options) (into-transformer t) :decode options)]
+       (cond
+         (and enter leave) (comp leave enter)
+         (or enter leave) (or enter leave)
+         :else identity))))
+
+  (defn decode
+    "Transforms a value with a given decoding transformer against a schema."
+    ([?schema value t]
+     (decode ?schema value nil t))
+    ([?schema value options t]
+     (if-let [transform (decoder ?schema options t)]
+       (transform value)
+       value)))
+
+  (defn encoder
+    "Creates a value encoding transformer given a transformer and a schema."
+    ([?schema t]
+     (encoder ?schema nil t))
+    ([?schema options t]
+     (let [{:keys [enter leave]} (-transformer (schema ?schema options) (into-transformer t) :encode options)]
+       (cond
+         (and enter leave) (comp leave enter)
+         (or enter leave) (or enter leave)
+         :else identity))))
+
+  (defn encode
+    "Transforms a value with a given encoding transformer against a schema."
+    ([?schema value t]
+     (encode ?schema value nil t))
+    ([?schema value options t]
+     (if-let [transform (encoder ?schema options t)]
+       (transform value)
+       value)))
+
+  (defn map-entries
+    "Returns a sequence of 3-element map-entry tuples of type `key ?properties schema`"
+    ([?schema]
+     (map-entries ?schema nil))
+    ([?schema options]
+     (if-let [schema (schema ?schema options)]
+       (if (satisfies? MapSchema schema)
+         (-map-entries schema)))))
+
+  (defn ^:no-doc eval [?code]
+    (if (fn? ?code) ?code (sci/eval-string (str ?code) {:preset :termination-safe
+                                                        :bindings {'m/properties properties
+                                                                   'm/name name
+                                                                   'm/children children
+                                                                   'm/map-entries map-entries}}))))
 ;;
 ;; Visitors
 ;;
@@ -822,7 +1002,7 @@
         #'qualified-keyword? #'symbol? #'simple-symbol? #'qualified-symbol? #'uuid? #'uri? #?(:clj #'decimal?)
         #'inst? #'seqable? #'indexed? #'map? #'vector? #'list? #'seq? #'char? #'set? #'nil? #'false? #'true?
         #'zero? #?(:clj #'rational?) #'coll? #'empty? #'associative? #'sequential? #?(:clj #'ratio?) #?(:clj #'bytes?)]
-       (reduce -register-var {})))
+       (reduce -register-predicate-var {})))
 
 (def class-registry
   {#?(:clj Pattern, :cljs js/RegExp) (-re-schema true)})
@@ -834,8 +1014,8 @@
        (reduce-kv -register nil)))
 
 (def base-registry
-  {:and (-composite-schema :and every-pred false)
-   :or (-composite-schema :or some-fn true)
+  {:and -and-schema #_(-composite-schema {:name :and :compose every-pred :short-circuit false :shrink true})
+   :or -or-schema #_(-composite-schema {:name :or :compose some-fn :short-circuit true :shrink true})
    :map (-map-schema)
    :map-of (-map-of-schema)
    :vector (-collection-schema :vector vector? vec [])
@@ -849,5 +1029,146 @@
    :re (-re-schema false)
    :fn (-fn-schema)})
 
+;; tweak s
+
+(defn- -raw-fn-schema [name guard?]
+  ^{:type ::into-schema}
+  (reify IntoSchema
+    (-into-schema [_ properties children options]
+      (if (> (count children) 1)
+        (schema (into [:>>] (map vector (repeat name) children)))
+        (let [f (first children)
+              f (if guard? (fn [x] (when (f x) x)) f)]
+          ^{:type ::schema}
+          (reify Schema
+            (-name [_] name)
+            (-conform [_] f)
+            (-explainer [this path]
+              (fn explain [x in acc]
+                (try
+                  (if-not (f x)
+                    (conj acc (error path in this x))
+                    acc)
+                  (catch #?(:clj Exception, :cljs js/Error) e
+                    (conj acc (error path in this x (:type (ex-data e))))))))
+            (-transformer [this transformer method options]
+              (-value-transformer transformer this method options))
+            (-accept [this visitor options] (visitor this (vec children) options))
+            (-properties [_] properties)
+            (-options [_] options)
+            (-form [_] (create-form name properties children))))))))
+
+(defn -lazy-schema []
+  (reify IntoSchema
+    (-into-schema [_ _ children options]
+      (when-not (= 1 (count children))
+        (fail! ::child-error {:name :fn, :properties properties, :children children, :min 1, :max 1}))
+      (let [schem (atom nil)
+            get-schema (fn [] (when (not @schem) (reset! schem (schema (first children) options))) @schem)]
+        (reify Schema
+          (-name [_] (-name (get-schema)))
+          (-conform [_] (fn [x] ((-conform (get-schema)) x)))
+          (-explainer [_ path] (-explainer (get-schema) path))
+          (-transformer [_ transformer method options]
+            (let [transformer (fn [] (-transformer (get-schema) transformer method options))]
+              {:enter (fn [x] ((:enter (transformer)) x))
+               :leave (fn [x] ((:leave (transformer)) x))}))
+          (-accept [_ visitor options] (-accept (get-schema) visitor options))
+          (-properties [_] (-properties (get-schema)))
+          (-options [_] (-options (get-schema)))
+          (-form [this] [:lazy (first children)]))))))
+
+(def -threading-schema
+  (-composite-schema
+    {:name :>>
+     :compose
+     (fn [conformers]
+       (letfn [(loop [x cs]
+                 (if (not (seq cs))
+                   x (when-let_c [x' ((first cs) x)]
+                                 (loop x' (next cs)))))]
+         (fn [x] (loop x conformers))))
+     :short-circuit false
+     :shrink false}))
+
+(def extra-registry
+
+  {:f (-raw-fn-schema :f false)
+   :g (-raw-fn-schema :g true)
+   :>> -threading-schema
+   :lazy (-lazy-schema)})
+
 (def default-registry
-  (clojure.core/merge predicate-registry class-registry comparator-registry base-registry))
+  (clojure.core/merge
+    predicate-registry class-registry
+    comparator-registry base-registry extra-registry))
+
+
+
+(do
+
+  (defn conform! [s x & [options]]
+    (assert (= x (conform s x options))))
+
+  (defn unconform! [s x]
+    (assert (unconform? (conform s x))))
+
+  ;;
+  (conform! number? 1)
+  (unconform! number? :1)
+
+  (conform! nil? nil)
+  (unconform! nil? 1)
+
+  (conform! false? false)
+  (unconform! false? nil)
+
+  (conform! any? nil)
+  (conform! any? 1)
+
+  (conform! [:or number? string?] 1)
+  (conform! [:or number? nil?] nil)
+  (conform! [:or number? string?] "aze")
+  (unconform! [:or number? string?] :op)
+
+  (conform! [:and number? pos-int?] 1)
+  (unconform! [:and number? pos-int?] -1)
+
+  (conform! [:tuple number? nil?] [1 nil])
+
+
+
+  (explain [:tuple any? any? [:vector string?]] [9 12 ["a" "b" 2]])
+
+  (conform! [:map [:a number?] [:b string?]]
+            {:a 1 :b "io"})
+
+  (unconform! [:map [:a number?] [:b string?]]
+              {:a 1 :b 2})
+
+  (unconform! [:map {:closed true} [:a number?] [:b string?]]
+              {:a 1 :b "a" :c 3})
+
+  ;; recursion
+  (conform!
+    :cons
+    [1 [2 [3 nil]]]
+    {:schemas {:cons [:or nil? [:tuple any? [:lazy :cons]]]}}))
+
+
+
+(comment
+
+  (clojure.pprint/pprint predicate-registry)
+
+  (defmacro bench [e & {:as options}]
+    `(let [start# (System/currentTimeMillis)
+           _# (dotimes [~'_ ~(:n options 1000000)] ~e)
+           done# (System/currentTimeMillis)]
+       {'~(:name options e) (- done# start#)}))
+
+  (let [v (conformer [:map {:closed true} [:a number?] [:b string?]])]
+    (bench (v {:a 1 :b "a" :c 3})))
+
+  (let [v (-validator (schema [:map {:closed true} [:a number?] [:b string?]]))]
+    (bench (v {:a 1 :b "a" :c 3}))))
