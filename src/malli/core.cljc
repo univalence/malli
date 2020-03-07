@@ -23,6 +23,7 @@
 (defprotocol Validator
   (-validator [this] "return a function that checks if the given value respects the current schema, returning a boolean"))
 
+(declare conform?)
 (extend-protocol Validator
   #?(:clj Object :cljs default)
   (-validator [this] (fn [x] (conform? (-conformer this)))))
